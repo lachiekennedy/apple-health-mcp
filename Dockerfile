@@ -8,7 +8,7 @@ WORKDIR /app
 COPY package*.json ./
 
 # Install ALL deps (including devDeps) so tsc is available for the build step
-RUN npm ci
+RUN npm install
 
 COPY tsconfig.json ./
 COPY src ./src
