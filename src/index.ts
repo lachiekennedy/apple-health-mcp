@@ -23,6 +23,7 @@ function openDb(): Database.Database {
   const db = new Database(DB_PATH);
   db.pragma('journal_mode = WAL');
 
+  // Base tables
   db.exec(`
     CREATE TABLE IF NOT EXISTS daily_nutrition (
       date        TEXT PRIMARY KEY,
@@ -31,18 +32,55 @@ function openDb(): Database.Database {
       carbs_g     REAL,
       fat_g       REAL,
       updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS raw_metrics (
-      id          INTEGER PRIMARY KEY AUTOINCREMENT,
-      date        TEXT NOT NULL,
-      metric_name TEXT NOT NULL,
-      value       REAL,
-      unit        TEXT,
-      ingested_at TEXT NOT NULL DEFAULT (datetime('now')),
-      UNIQUE(date, metric_name)
-    );
+    )
   `);
+
+  // ------------------------------------------------------------------
+  // raw_metrics schema v2: entry_ts makes the unique key so that each
+  // individual meal entry (from Health Auto Export) is stored separately.
+  // Unique key = (date, metric_name, entry_ts) — re-posting the exact
+  // same export is idempotent; new meals add new rows; the DELETE step
+  // in upsertData replaces the whole set for a (date, metric_name) pair.
+  // ------------------------------------------------------------------
+  const cols = db.prepare('PRAGMA table_info(raw_metrics)').all() as { name: string }[];
+
+  if (cols.length === 0) {
+    // Fresh install
+    db.exec(`
+      CREATE TABLE raw_metrics (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        date        TEXT NOT NULL,
+        metric_name TEXT NOT NULL,
+        entry_ts    TEXT NOT NULL DEFAULT '',
+        value       REAL,
+        unit        TEXT,
+        ingested_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(date, metric_name, entry_ts)
+      )
+    `);
+  } else if (!cols.some(c => c.name === 'entry_ts')) {
+    // Migrate v1 → v2: add entry_ts to unique key
+    db.exec(`
+      CREATE TABLE raw_metrics_v2 (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        date        TEXT NOT NULL,
+        metric_name TEXT NOT NULL,
+        entry_ts    TEXT NOT NULL DEFAULT '',
+        value       REAL,
+        unit        TEXT,
+        ingested_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(date, metric_name, entry_ts)
+      )
+    `);
+    db.exec(`
+      INSERT OR IGNORE INTO raw_metrics_v2
+        (id, date, metric_name, entry_ts, value, unit, ingested_at)
+      SELECT id, date, metric_name, '', value, unit, ingested_at
+      FROM raw_metrics
+    `);
+    db.exec('DROP TABLE raw_metrics');
+    db.exec('ALTER TABLE raw_metrics_v2 RENAME TO raw_metrics');
+  }
 
   return db;
 }
@@ -50,20 +88,18 @@ function openDb(): Database.Database {
 const db = openDb();
 
 // ---------------------------------------------------------------------------
-// Ingest helpers
+// Nutrition mapping
 // ---------------------------------------------------------------------------
 
 // Maps every known Health Auto Export metric name (lowercased) → nutrition column.
-// Health Auto Export uses snake_case names derived from Apple Health identifiers.
-// Units tell us whether to convert (kJ → kcal for energy).
+// Health Auto Export uses snake_case derived from Apple Health identifiers.
 const NUTRITION_MAP: Record<string, keyof NutritionRow> = {
-  // ---- Dietary energy (arrives in kJ or kcal depending on region) ----------
-  // snake_case (what Health Auto Export actually sends):
+  // Dietary energy — snake_case (what Health Auto Export actually sends)
   'dietary_energy':                  'calories',
   'dietary_energy_consumed':         'calories',
   'energy_consumed':                 'calories',
   'dietary_calories':                'calories',
-  // space-separated variants (some export configs / older versions):
+  // space-separated variants (older export configs)
   'dietary energy':                  'calories',
   'dietary energy consumed':         'calories',
   'energy consumed':                 'calories',
@@ -72,13 +108,13 @@ const NUTRITION_MAP: Record<string, keyof NutritionRow> = {
   'energy':                          'calories',
   'hkquantitytypeidentifierdietaryenergyconsumed': 'calories',
 
-  // ---- Protein --------------------------------------------------------------
+  // Protein
   'protein':                         'protein_g',
   'dietary_protein':                 'protein_g',
   'dietary protein':                 'protein_g',
   'hkquantitytypeidentifierdietaryprotein': 'protein_g',
 
-  // ---- Carbohydrates -------------------------------------------------------
+  // Carbohydrates
   'carbohydrates':                   'carbs_g',
   'dietary_carbohydrates':           'carbs_g',
   'dietary carbohydrates':           'carbs_g',
@@ -87,12 +123,11 @@ const NUTRITION_MAP: Record<string, keyof NutritionRow> = {
   'total carbohydrates':             'carbs_g',
   'hkquantitytypeidentifierdietarycarbohydrates': 'carbs_g',
 
-  // ---- Total fat -----------------------------------------------------------
-  // snake_case (what Health Auto Export actually sends):
+  // Total fat — snake_case (what Health Auto Export actually sends)
   'total_fat':                       'fat_g',
   'dietary_fat_total':               'fat_g',
   'dietary_fat':                     'fat_g',
-  // space-separated variants:
+  // space-separated variants
   'total fat':                       'fat_g',
   'dietary fat total':               'fat_g',
   'dietary fat - total':             'fat_g',
@@ -101,9 +136,9 @@ const NUTRITION_MAP: Record<string, keyof NutritionRow> = {
   'hkquantitytypeidentifierdietaryfattotal': 'fat_g',
 };
 
-// Units that mean kilojoules — must be converted to kcal before storing.
-const KJ_UNITS = new Set(['kj', 'kilojoule', 'kilojoules']);
-const KJ_TO_KCAL = 1 / 4.184;
+// Units that mean kilojoules → convert to kcal (1 kcal = 4.184 kJ)
+const KJ_UNITS    = new Set(['kj', 'kilojoule', 'kilojoules']);
+const KJ_TO_KCAL  = 1 / 4.184;
 
 interface NutritionRow {
   date:      string;
@@ -116,17 +151,18 @@ interface NutritionRow {
 // ---------------------------------------------------------------------------
 // extractEntries
 //
-// Health Auto Export payloads come in several shapes:
-//   { data: { metrics: [ { name, units, data: [ { date, qty } ] } ] } }
-//   { metrics: [ ... ] }
-//   { data: [ { name, data: [...] } ] }
-//
-// We normalise to { metricName, date, value, unit } tuples.
-// Multiple data points for the same (date, metricName) in one payload are
-// SUMMED — Health Auto Export can send individual meal entries rather than
-// daily aggregates, and we want the full-day total.
+// Normalises a Health Auto Export payload into individual MetricEntry records.
+// Each data point in the source becomes exactly ONE entry — we do NOT sum here.
+// The entry_ts (full timestamp string from the source) is the deduplication key:
+// re-posting the same export produces the same entry_ts values → idempotent.
 // ---------------------------------------------------------------------------
-interface MetricEntry { date: string; value: number; unit: string; metricName: string; }
+interface MetricEntry {
+  date:       string;   // YYYY-MM-DD
+  entryTs:    string;   // full source timestamp, e.g. "2026-06-07 07:00:00 +1000"
+  metricName: string;   // lowercased metric name
+  value:      number;   // converted to kcal for energy, otherwise raw unit
+  unit:       string;   // original unit (lowercase)
+}
 
 function extractEntries(body: unknown): MetricEntry[] {
   const payload = (body as Record<string, unknown>) ?? {};
@@ -135,103 +171,132 @@ function extractEntries(body: unknown): MetricEntry[] {
   const metricsTop = payload['metrics'] as unknown[] | undefined;
 
   const metricArrays: unknown[] = [];
-  if (Array.isArray(metricsTop))         metricArrays.push(...metricsTop);
-  if (Array.isArray(dataField))          metricArrays.push(...dataField);
+  if (Array.isArray(metricsTop))        metricArrays.push(...metricsTop);
+  if (Array.isArray(dataField))         metricArrays.push(...dataField);
   if (dataField && !Array.isArray(dataField)) {
     const nested = (dataField as Record<string, unknown>)['metrics'];
     if (Array.isArray(nested)) metricArrays.push(...nested);
   }
 
-  // Accumulate into a map so multiple same-day entries for one metric are summed.
-  const summed = new Map<string, MetricEntry>();
+  const entries: MetricEntry[] = [];
 
   for (const metric of metricArrays) {
-    const m       = metric as Record<string, unknown>;
-    const rawName = ((m['name'] ?? m['metric_name'] ?? '') as string).toLowerCase().trim();
-    const unit    = ((m['units'] ?? m['unit'] ?? '') as string).trim().toLowerCase();
-    const dataArr = (m['data'] ?? m['dataPoints'] ?? m['samples']) as unknown[] | undefined;
+    const m        = metric as Record<string, unknown>;
+    const rawName  = ((m['name'] ?? m['metric_name'] ?? '') as string).toLowerCase().trim();
+    const unit     = ((m['units'] ?? m['unit'] ?? '') as string).trim().toLowerCase();
+    const dataArr  = (m['data'] ?? m['dataPoints'] ?? m['samples']) as unknown[] | undefined;
     if (!rawName || !Array.isArray(dataArr)) continue;
 
+    const isEnergy = NUTRITION_MAP[rawName] === 'calories';
+
     for (const point of dataArr) {
-      const p     = point as Record<string, unknown>;
-      const rawDate = (p['date'] ?? p['startDate'] ?? p['endDate'] ?? '') as string;
-      const date  = rawDate.slice(0, 10);            // YYYY-MM-DD
-      const raw   = Number(p['qty'] ?? p['value'] ?? p['quantity'] ?? NaN);
+      const p       = point as Record<string, unknown>;
+      const entryTs = String(p['date'] ?? p['startDate'] ?? p['endDate'] ?? '');
+      const date    = entryTs.slice(0, 10);            // YYYY-MM-DD
+      const raw     = Number(p['qty'] ?? p['value'] ?? p['quantity'] ?? NaN);
       if (!date || Number.isNaN(raw)) continue;
 
-      // Convert kJ → kcal for energy metrics
-      const isEnergy = NUTRITION_MAP[rawName] === 'calories';
-      const value = isEnergy && KJ_UNITS.has(unit) ? raw * KJ_TO_KCAL : raw;
-
-      const key = `${date}::${rawName}`;
-      if (summed.has(key)) {
-        summed.get(key)!.value += value;
-      } else {
-        summed.set(key, { date, value, unit, metricName: rawName });
-      }
+      const value   = isEnergy && KJ_UNITS.has(unit) ? raw * KJ_TO_KCAL : raw;
+      entries.push({ date, entryTs, metricName: rawName, value, unit });
     }
   }
 
-  return [...summed.values()];
+  return entries;
 }
 
+// ---------------------------------------------------------------------------
+// upsertData
+//
+// For each (date, metric_name) pair in this batch:
+//   1. DELETE all existing raw_metrics rows for that pair — the incoming export
+//      is the authoritative set of entries for those dates/metrics.
+//   2. INSERT the new individual entries.
+// Then recompute daily_nutrition by SUM-ing raw_metrics for affected dates.
+// This makes re-posting the same export fully idempotent and prevents
+// accumulation across repeated posts.
+// ---------------------------------------------------------------------------
 function upsertData(entries: MetricEntry[]): { nutrition: number; metrics: number } {
-  const nutritionByDate = new Map<string, Partial<NutritionRow>>();
+  if (entries.length === 0) return { nutrition: 0, metrics: 0 };
 
-  const upsertRaw = db.prepare(`
-    INSERT INTO raw_metrics (date, metric_name, value, unit)
-    VALUES (@date, @metric_name, @value, @unit)
-    ON CONFLICT(date, metric_name) DO UPDATE SET
-      value       = excluded.value,
-      unit        = excluded.unit,
-      ingested_at = datetime('now')
+  // Unique (date, metricName) pairs covered by this export
+  const pairs = [...new Set(entries.map(e => `${e.date}\t${e.metricName}`))].map(k => {
+    const [date, metricName] = k.split('\t');
+    return { date, metricName };
+  });
+
+  const deleteForPair = db.prepare(
+    'DELETE FROM raw_metrics WHERE date = ? AND metric_name = ?'
+  );
+
+  const insertEntry = db.prepare(`
+    INSERT OR REPLACE INTO raw_metrics (date, metric_name, entry_ts, value, unit)
+    VALUES (@date, @metric_name, @entry_ts, @value, @unit)
   `);
 
   let metricsCount = 0;
-  const upsertMany = db.transaction((rows: MetricEntry[]) => {
-    for (const e of rows) {
-      upsertRaw.run({ date: e.date, metric_name: e.metricName, value: e.value, unit: e.unit });
-      metricsCount++;
 
-      const col = NUTRITION_MAP[e.metricName];
-      if (col && col !== 'date') {
-        if (!nutritionByDate.has(e.date)) nutritionByDate.set(e.date, { date: e.date });
-        const row = nutritionByDate.get(e.date)! as Record<string, unknown>;
-        // Accumulate in case extractEntries produced multiple rows for the same
-        // (date, col) after a re-ingest of differently-shaped data.
-        row[col] = ((row[col] as number | undefined) ?? 0) + e.value;
-      }
+  // Replace existing entries for affected (date, metric) pairs, then insert new ones
+  db.transaction(() => {
+    for (const { date, metricName } of pairs) {
+      deleteForPair.run(date, metricName);
     }
-  });
+    for (const e of entries) {
+      insertEntry.run({
+        date:        e.date,
+        metric_name: e.metricName,
+        entry_ts:    e.entryTs,
+        value:       e.value,
+        unit:        e.unit,
+      });
+      metricsCount++;
+    }
+  })();
 
-  upsertMany(entries);
+  // Recompute daily_nutrition for all affected dates from raw_metrics SUM
+  const affectedDates = [...new Set(entries.map(e => e.date))];
 
-  const upsertNutrition = db.prepare(`
+  const sumsByDate = db.prepare(`
+    SELECT metric_name, SUM(value) AS total
+    FROM raw_metrics
+    WHERE date = ?
+    GROUP BY metric_name
+  `);
+
+  const replaceNutrition = db.prepare(`
     INSERT INTO daily_nutrition (date, calories, protein_g, carbs_g, fat_g)
     VALUES (@date, @calories, @protein_g, @carbs_g, @fat_g)
     ON CONFLICT(date) DO UPDATE SET
-      calories   = COALESCE(excluded.calories,  daily_nutrition.calories),
-      protein_g  = COALESCE(excluded.protein_g, daily_nutrition.protein_g),
-      carbs_g    = COALESCE(excluded.carbs_g,   daily_nutrition.carbs_g),
-      fat_g      = COALESCE(excluded.fat_g,     daily_nutrition.fat_g),
+      calories   = excluded.calories,
+      protein_g  = excluded.protein_g,
+      carbs_g    = excluded.carbs_g,
+      fat_g      = excluded.fat_g,
       updated_at = datetime('now')
   `);
 
-  const upsertNutritionTx = db.transaction((rows: Partial<NutritionRow>[]) => {
-    for (const r of rows) {
-      upsertNutrition.run({
-        date:      r.date      ?? '',
-        calories:  r.calories  ?? null,
-        protein_g: r.protein_g ?? null,
-        carbs_g:   r.carbs_g   ?? null,
-        fat_g:     r.fat_g     ?? null,
-      });
+  const nutritionDates = new Set<string>();
+
+  db.transaction(() => {
+    for (const date of affectedDates) {
+      const sums = sumsByDate.all(date) as { metric_name: string; total: number }[];
+      const row: Record<string, number | null> = {
+        calories: null, protein_g: null, carbs_g: null, fat_g: null,
+      };
+      for (const { metric_name, total } of sums) {
+        const col = NUTRITION_MAP[metric_name];
+        if (col && col !== 'date') {
+          // Values are already converted to kcal by extractEntries
+          row[col] = (row[col] ?? 0) + total;
+        }
+      }
+      // Only write daily_nutrition if at least one nutrition column is populated
+      if (Object.values(row).some(v => v !== null)) {
+        replaceNutrition.run({ date, ...row });
+        nutritionDates.add(date);
+      }
     }
-  });
+  })();
 
-  upsertNutritionTx([...nutritionByDate.values()]);
-
-  return { nutrition: nutritionByDate.size, metrics: metricsCount };
+  return { nutrition: nutritionDates.size, metrics: metricsCount };
 }
 
 // ---------------------------------------------------------------------------
@@ -239,7 +304,8 @@ function upsertData(entries: MetricEntry[]): { nutrition: number; metrics: numbe
 // ---------------------------------------------------------------------------
 function getNutritionToday() {
   const today = new Date().toISOString().slice(0, 10);
-  return db.prepare(`SELECT * FROM daily_nutrition WHERE date = ?`).get(today) as NutritionRow | undefined;
+  return db.prepare('SELECT * FROM daily_nutrition WHERE date = ?')
+    .get(today) as NutritionRow | undefined;
 }
 
 function getNutritionHistory(days: number) {
@@ -257,7 +323,6 @@ function getHealthSummary(days: number) {
     WHERE date >= date('now', ? || ' days')
     ORDER BY metric_name
   `).all(`-${days}`) as { metric_name: string; unit: string }[];
-
   return { nutrition, availableMetrics: metricNames };
 }
 
@@ -274,12 +339,12 @@ function createMcpServer(): Server {
     tools: [
       {
         name: 'get_nutrition_today',
-        description: "Get today's nutrition: calories (kcal), protein, carbs, fat (all in grams).",
+        description: "Get today's nutrition: calories (kcal), protein, carbs, fat (grams).",
         inputSchema: { type: 'object', properties: {}, required: [] },
       },
       {
         name: 'get_nutrition_history',
-        description: 'Get daily nutrition totals for the past N days (default 14, max 90).',
+        description: 'Daily nutrition totals for the past N days (default 14, max 90).',
         inputSchema: {
           type: 'object',
           properties: { days: { type: 'number', description: 'Number of days (default 14, max 90)' } },
@@ -288,7 +353,7 @@ function createMcpServer(): Server {
       },
       {
         name: 'get_health_summary',
-        description: 'Summary of all stored health metrics and nutrition averages for the past N days.',
+        description: 'All stored health metrics + nutrition averages for the past N days.',
         inputSchema: {
           type: 'object',
           properties: { days: { type: 'number', description: 'Number of days (default 7, max 90)' } },
@@ -307,8 +372,7 @@ function createMcpServer(): Server {
       return Number.isNaN(n) || n < 1 ? def : Math.min(n, 90);
     };
 
-    // Helper: display a nullable number as a formatted string, or '0' if null.
-    const fmt  = (v: number | null, dp: number) => (v ?? 0).toFixed(dp);
+    const fmt = (v: number | null, dp: number) => (v ?? 0).toFixed(dp);
 
     try {
       switch (name) {
@@ -338,11 +402,15 @@ function createMcpServer(): Server {
             `| ${r.date} | ${fmt(r.calories, 0)} | ${fmt(r.protein_g, 1)} | ${fmt(r.carbs_g, 1)} | ${fmt(r.fat_g, 1)} |`
           );
           const n = rows.length;
-          const avgCal  = rows.reduce((s, r) => s + (r.calories  ?? 0), 0) / n;
-          const avgProt = rows.reduce((s, r) => s + (r.protein_g ?? 0), 0) / n;
-          const avgCarb = rows.reduce((s, r) => s + (r.carbs_g   ?? 0), 0) / n;
-          const avgFat  = rows.reduce((s, r) => s + (r.fat_g     ?? 0), 0) / n;
-          const summary = `\n## Averages\n- Calories: ${avgCal.toFixed(0)} kcal\n- Protein: ${avgProt.toFixed(1)} g\n- Carbs: ${avgCarb.toFixed(1)} g\n- Fat: ${avgFat.toFixed(1)} g`;
+          const avg = (key: keyof NutritionRow) =>
+            rows.reduce((s, r) => s + ((r[key] as number | null) ?? 0), 0) / n;
+          const summary = [
+            '\n## Averages',
+            `- Calories: ${avg('calories').toFixed(0)} kcal`,
+            `- Protein: ${avg('protein_g').toFixed(1)} g`,
+            `- Carbs: ${avg('carbs_g').toFixed(1)} g`,
+            `- Fat: ${avg('fat_g').toFixed(1)} g`,
+          ].join('\n');
           return { content: [{ type: 'text', text: [header, ...lines, summary].join('\n') }] };
         }
 
@@ -391,22 +459,17 @@ setInterval(() => {
 
 const app = express();
 
-// IMPORTANT: JSON body parsing is scoped only to routes that need it.
-// /mcp must NOT have its body pre-parsed — the MCP SDK reads the raw stream itself.
+// JSON parsing scoped to routes that need it — /mcp must NOT have body pre-parsed
 app.use('/ingest',        express.json({ limit: '20mb' }));
 app.use('/health',        express.json());
 app.use('/debug/metrics', express.json());
 
-// ---------------------------------------------------------------------------
-// Bearer token guard — applied to /ingest AND /debug/metrics
-// ---------------------------------------------------------------------------
 function requireToken(req: Request, res: Response, next: NextFunction) {
   if (!INGEST_TOKEN) {
     res.status(503).json({ error: 'INGEST_TOKEN not configured on server' });
     return;
   }
-  const auth = req.headers['authorization'] ?? '';
-  if (auth !== `Bearer ${INGEST_TOKEN}`) {
+  if (req.headers['authorization'] !== `Bearer ${INGEST_TOKEN}`) {
     res.status(401).json({ error: 'Unauthorized' });
     return;
   }
@@ -414,54 +477,42 @@ function requireToken(req: Request, res: Response, next: NextFunction) {
 }
 
 // ---------------------------------------------------------------------------
-// POST /ingest — receive Health Auto Export payload
+// POST /ingest
 // ---------------------------------------------------------------------------
 app.post('/ingest', requireToken, (req: Request, res: Response) => {
   try {
-    // Log metric names + units so Railway's log stream shows what arrived.
     const body = req.body as Record<string, unknown>;
-    const topLevelKeys = Object.keys(body);
-    console.log('[ingest] top-level keys:', topLevelKeys);
 
-    // Extract all metric names + units from the raw payload for diagnostics
-    const allMetrics: { name: string; units: string }[] = [];
+    // Diagnostic: list all metric names in this payload
     const payloadMetrics = (() => {
       const d = body['data'] as Record<string, unknown> | undefined;
       if (d && !Array.isArray(d)) return d['metrics'] as unknown[] | undefined;
       return body['metrics'] as unknown[] | undefined;
     })();
+    const allMetrics: { name: string; units: string }[] = [];
     if (Array.isArray(payloadMetrics)) {
       for (const m of payloadMetrics) {
         const mm = m as Record<string, unknown>;
-        allMetrics.push({
-          name:  String(mm['name'] ?? mm['metric_name'] ?? ''),
-          units: String(mm['units'] ?? mm['unit'] ?? ''),
-        });
+        allMetrics.push({ name: String(mm['name'] ?? ''), units: String(mm['units'] ?? '') });
       }
     }
-    console.log('[ingest] metrics in payload:', JSON.stringify(allMetrics));
+    console.log('[ingest] metrics in payload:', allMetrics.map(m => `${m.name}(${m.units})`).join(', '));
 
     const entries = extractEntries(body);
-    console.log('[ingest] extracted entries count:', entries.length);
+    console.log('[ingest] individual entries extracted:', entries.length);
+
     if (entries.length === 0) {
-      console.log('[ingest] WARNING: no entries extracted. Raw body (first 2000 chars):', JSON.stringify(body).slice(0, 2000));
-      res.status(422).json({ error: 'No recognisable metric data found in payload', metricsFound: allMetrics });
+      res.status(422).json({ error: 'No recognisable metric data in payload', allMetrics });
       return;
     }
 
-    // Show which nutrition fields were matched
-    const matched = [...new Set(entries.map(e => `${e.metricName} → ${NUTRITION_MAP[e.metricName] ?? '(raw only)'} [${e.unit}]`))];
+    const matched = [...new Set(
+      entries.map(e => `${e.metricName} → ${NUTRITION_MAP[e.metricName] ?? '(raw)'} [${e.unit}]`)
+    )];
     console.log('[ingest] matched fields:', matched);
 
     const stats = upsertData(entries);
-    res.json({
-      ok:              true,
-      entries:         entries.length,
-      nutritionDays:   stats.nutrition,
-      metricsUpserted: stats.metrics,
-      matchedFields:   matched,
-      allPayloadMetrics: allMetrics,
-    });
+    res.json({ ok: true, entries: entries.length, nutritionDays: stats.nutrition, metricsUpserted: stats.metrics, matchedFields: matched, allMetrics });
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error';
     console.error('[ingest] error:', msg);
@@ -470,27 +521,31 @@ app.post('/ingest', requireToken, (req: Request, res: Response) => {
 });
 
 // ---------------------------------------------------------------------------
-// GET /debug/metrics — returns every distinct (metric_name, unit) in the DB
-// Protected by INGEST_TOKEN so it's not public.
+// GET /debug/metrics  (protected)
 // ---------------------------------------------------------------------------
 app.get('/debug/metrics', requireToken, (_req: Request, res: Response) => {
-  const rows = db.prepare(`
-    SELECT metric_name, unit, COUNT(*) as days, MAX(date) as latest_date, MAX(value) as max_value
+  const rawMetrics = db.prepare(`
+    SELECT metric_name, unit, COUNT(*) AS entries, MAX(date) AS latest_date, SUM(value) AS total_value
     FROM raw_metrics
     GROUP BY metric_name, unit
     ORDER BY metric_name
-  `).all() as { metric_name: string; unit: string; days: number; latest_date: string; max_value: number }[];
+  `).all() as { metric_name: string; unit: string; entries: number; latest_date: string; total_value: number }[];
 
-  const withMapping = rows.map(r => ({
-    ...r,
-    mapsTo: NUTRITION_MAP[r.metric_name.toLowerCase().trim()] ?? null,
-  }));
+  const recentNutrition = db.prepare(
+    'SELECT * FROM daily_nutrition ORDER BY date DESC LIMIT 7'
+  ).all();
 
-  const nutritionSample = db.prepare(`
-    SELECT * FROM daily_nutrition ORDER BY date DESC LIMIT 7
-  `).all();
+  const sampleEntries = db.prepare(
+    'SELECT date, metric_name, entry_ts, value, unit FROM raw_metrics ORDER BY date DESC, metric_name LIMIT 30'
+  ).all();
 
-  res.json({ rawMetrics: withMapping, recentNutrition: nutritionSample });
+  res.json({
+    rawMetrics: rawMetrics.map(r => ({
+      ...r, mapsTo: NUTRITION_MAP[r.metric_name.toLowerCase().trim()] ?? null,
+    })),
+    recentNutrition,
+    sampleEntries,
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -501,7 +556,7 @@ app.get('/health', (_req: Request, res: Response) => {
 });
 
 // ---------------------------------------------------------------------------
-// POST /mcp (and DELETE for session teardown) — raw stream, no body pre-parsing
+// POST/DELETE /mcp  — raw stream, no body pre-parsing
 // ---------------------------------------------------------------------------
 app.all('/mcp', async (req: Request, res: Response) => {
   const sessionId = req.headers['mcp-session-id'] as string | undefined;
@@ -516,7 +571,6 @@ app.all('/mcp', async (req: Request, res: Response) => {
 
   if (req.method === 'POST') {
     let transport: StreamableHTTPServerTransport;
-
     if (sessionId && transports.has(sessionId)) {
       const s = transports.get(sessionId)!;
       s.lastAccess = Date.now();
@@ -524,14 +578,10 @@ app.all('/mcp', async (req: Request, res: Response) => {
     } else {
       transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => crypto.randomUUID(),
-        onsessioninitialized: (id) => {
-          transports.set(id, { transport, lastAccess: Date.now() });
-        },
+        onsessioninitialized: (id) => transports.set(id, { transport, lastAccess: Date.now() }),
       });
-      const server = createMcpServer();
-      await server.connect(transport);
+      await createMcpServer().connect(transport);
     }
-
     await transport.handleRequest(req, res);
     return;
   }
@@ -543,9 +593,8 @@ app.all('/mcp', async (req: Request, res: Response) => {
 // Start
 // ---------------------------------------------------------------------------
 const httpServer = app.listen(PORT, '0.0.0.0', () => {
-  process.stdout.write(`Apple Health MCP server listening on http://0.0.0.0:${PORT}\n`);
-  process.stdout.write(`DB path: ${DB_PATH}\n`);
-  process.stdout.write(`INGEST_TOKEN configured: ${Boolean(INGEST_TOKEN)}\n`);
+  process.stdout.write(`Apple Health MCP server on http://0.0.0.0:${PORT}\n`);
+  process.stdout.write(`DB: ${DB_PATH} | INGEST_TOKEN: ${Boolean(INGEST_TOKEN)}\n`);
 });
 
 const shutdown = () => {
