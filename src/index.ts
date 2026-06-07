@@ -54,37 +54,50 @@ const db = openDb();
 // ---------------------------------------------------------------------------
 
 // Maps every known Health Auto Export metric name (lowercased) → nutrition column.
-// Health Auto Export uses Apple Health's display names. Units tell us whether
-// to convert (kJ → kcal for energy).
+// Health Auto Export uses snake_case names derived from Apple Health identifiers.
+// Units tell us whether to convert (kJ → kcal for energy).
 const NUTRITION_MAP: Record<string, keyof NutritionRow> = {
   // ---- Dietary energy (arrives in kJ or kcal depending on region) ----------
+  // snake_case (what Health Auto Export actually sends):
+  'dietary_energy':                  'calories',
+  'dietary_energy_consumed':         'calories',
+  'energy_consumed':                 'calories',
+  'dietary_calories':                'calories',
+  // space-separated variants (some export configs / older versions):
   'dietary energy':                  'calories',
   'dietary energy consumed':         'calories',
   'energy consumed':                 'calories',
   'dietary calories':                'calories',
   'calories':                        'calories',
   'energy':                          'calories',
-  // Apple Health internal name sometimes exposed by Health Auto Export:
   'hkquantitytypeidentifierdietaryenergyconsumed': 'calories',
 
   // ---- Protein --------------------------------------------------------------
   'protein':                         'protein_g',
+  'dietary_protein':                 'protein_g',
   'dietary protein':                 'protein_g',
   'hkquantitytypeidentifierdietaryprotein': 'protein_g',
 
   // ---- Carbohydrates -------------------------------------------------------
   'carbohydrates':                   'carbs_g',
+  'dietary_carbohydrates':           'carbs_g',
   'dietary carbohydrates':           'carbs_g',
   'carbs':                           'carbs_g',
+  'total_carbohydrates':             'carbs_g',
   'total carbohydrates':             'carbs_g',
   'hkquantitytypeidentifierdietarycarbohydrates': 'carbs_g',
 
   // ---- Total fat -----------------------------------------------------------
+  // snake_case (what Health Auto Export actually sends):
+  'total_fat':                       'fat_g',
+  'dietary_fat_total':               'fat_g',
+  'dietary_fat':                     'fat_g',
+  // space-separated variants:
   'total fat':                       'fat_g',
   'dietary fat total':               'fat_g',
   'dietary fat - total':             'fat_g',
-  'fat':                             'fat_g',
   'dietary fat':                     'fat_g',
+  'fat':                             'fat_g',
   'hkquantitytypeidentifierdietaryfattotal': 'fat_g',
 };
 
@@ -144,7 +157,7 @@ function extractEntries(body: unknown): MetricEntry[] {
       const rawDate = (p['date'] ?? p['startDate'] ?? p['endDate'] ?? '') as string;
       const date  = rawDate.slice(0, 10);            // YYYY-MM-DD
       const raw   = Number(p['qty'] ?? p['value'] ?? p['quantity'] ?? NaN);
-      if (!date || Number.isNaN(raw) || raw === 0) continue;
+      if (!date || Number.isNaN(raw)) continue;
 
       // Convert kJ → kcal for energy metrics
       const isEnergy = NUTRITION_MAP[rawName] === 'calories';
