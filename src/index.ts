@@ -561,27 +561,50 @@ app.get('/health', (_req: Request, res: Response) => {
 app.all('/mcp', async (req: Request, res: Response) => {
   const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
-  if (req.method === 'DELETE' && sessionId && transports.has(sessionId)) {
-    const s = transports.get(sessionId)!;
-    await s.transport.close();
-    transports.delete(sessionId);
-    res.status(200).send('Session closed');
+  // ── DELETE ──────────────────────────────────────────────────────────────
+  if (req.method === 'DELETE') {
+    if (sessionId && transports.has(sessionId)) {
+      const s = transports.get(sessionId)!;
+      await s.transport.close();
+      transports.delete(sessionId);
+      res.status(200).send('Session closed');
+    } else {
+      res.status(404).json({ error: 'Session not found' });
+    }
     return;
   }
 
+  // ── POST ─────────────────────────────────────────────────────────────────
   if (req.method === 'POST') {
+    // Per MCP Streamable-HTTP spec §3.3: if the client supplies a session ID
+    // the server does not recognise, return 404 so the client knows to
+    // reinitialise.  Without this, the old code created a fresh uninitialized
+    // transport and the SDK returned "Server not initialized" (400), which
+    // Claude.ai surfaces as "Error occurred during tool execution."
+    if (sessionId && !transports.has(sessionId)) {
+      console.log(`[mcp] unknown session ${sessionId} → 404, client should reinitialise`);
+      res.status(404).json({ error: 'Session expired or not found. Please reinitialise.' });
+      return;
+    }
+
     let transport: StreamableHTTPServerTransport;
     if (sessionId && transports.has(sessionId)) {
+      // Resume existing session
       const s = transports.get(sessionId)!;
       s.lastAccess = Date.now();
       transport = s.transport;
     } else {
+      // No session ID → this must be an `initialize` request; create new session
       transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => crypto.randomUUID(),
-        onsessioninitialized: (id) => transports.set(id, { transport, lastAccess: Date.now() }),
+        onsessioninitialized: (id) => {
+          transports.set(id, { transport, lastAccess: Date.now() });
+          console.log(`[mcp] new session initialised: ${id}`);
+        },
       });
       await createMcpServer().connect(transport);
     }
+
     await transport.handleRequest(req, res);
     return;
   }
